@@ -1,0 +1,7 @@
+{
+    "packageType": "app",
+    "appName": "TV Privacy Audit",
+    "version": "1.0.0",
+    "description": "Collects system state for a privacy audit and reports it to the host PC",
+    "serviceFile": "audit.js"
+}
