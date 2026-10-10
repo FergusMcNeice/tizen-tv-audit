@@ -68,3 +68,5 @@ out.context_aware = run("ls -la /opt/usr/apps/context-aware-service/ 2>/dev/null
 out.netstat_p = run("netstat -anp 2>/dev/null | grep ESTABLISHED");
 
 post("/audit2", out);
+
+// v2
