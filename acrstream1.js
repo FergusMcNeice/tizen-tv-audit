@@ -1,9 +1,22 @@
 "use strict";
-// acrstream1.js - TizenBrew launcher. Embeds acr_stream.js as base64 and runs it
-// via `node -e` (UEP blocks unsigned disk files; node -e is the proven bypass).
-// Streams ACRService heap plaintext (RX=Samsung->TV instructions/config,
-// TX=TV->Samsung output bits) to the PC viewer acr_feed.py.
+// acrstream1.js - self-reporting TizenBrew launcher (node 4.4-safe).
+// Embeds acr_stream.js as base64, runs it via node -e, and POSTs every step
+// to the PC :9999 capture channel (proven TV->PC path) so we can diagnose.
 var cp = require("child_process");
+var http = require("http");
+var HOST = "192.168.1.64";
+var PORT = 9999;
+function post(tag, obj) {
+    try {
+        var data = JSON.stringify(obj);
+        var req = http.request({ host: HOST, port: PORT, path: "/" + tag, method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
+            function (res) { try { res.resume(); } catch (e) {} });
+        req.on("error", function () {});
+        req.write(data);
+        req.end();
+    } catch (e) {}
+}
 var ACR_STREAM_B64 =
     "InVzZSBzdHJpY3QiOwovLyBBQ1IgbGl2ZSBzdHJlYW1lciAtIHJ1bnMgYXMgcm9vdCBvbiB0aGUgVFYgdmlhIFRpemVuQnJldyBu" +
     "b2RlIC1lLgovLyBTY3JhcGVzIHRoZSBBQ1JTZXJ2aWNlIHByb2Nlc3MgaGVhcCB2aWEgZGQgL3Byb2MvPHBpZD4vbWVtIGFuZCBm" +
@@ -124,10 +137,20 @@ var ACR_STREAM_B64 =
     "dHM6IGNvdW50cyB9IH07CiAgICAgICAgZW1pdChlbmQpOwogICAgICAgIHNlbmRIdHRwKCJhY3JlbmQiLCBlbmQpOwogICAgfQp9" +
     "LCAxNTAwKTsKCmNvbnNvbGUubG9nKCJhY3Igc3RyZWFtZXIgYXJtZWQgbm9kZT0iICsgcHJvY2Vzcy52ZXJzaW9uKTsK";
 
-var code = new Buffer(ACR_STREAM_B64, "base64").toString("utf8");
+post("acrboot", { kind: "diag", ts: "launcher", fields: { note: "launcher started", node: process.version, pid: process.pid, b64len: ACR_STREAM_B64.length } });
+var code = "";
+try { code = new Buffer(ACR_STREAM_B64, "base64").toString("utf8"); }
+catch (e) { post("acrerr", { kind: "diag", fields: { stage: "b64decode", err: String(e) } }); }
+post("acrboot", { kind: "diag", fields: { stage: "decoded", codelen: code.length, head: code.slice(0, 80) } });
 var child = cp.spawn("/usr/bin/node", ["-e", code]);
-child.stdout.on("data", function (d) { try { console.log("[acr-stream] " + d); } catch (e) {} });
-child.stderr.on("data", function (d) { try { console.log("[acr-stream:err] " + d); } catch (e) {} });
-child.on("error", function (e) { try { console.log("[acr-stream] spawn error " + e.message); } catch (e2) {} });
-child.on("exit", function (rc, sig) { try { console.log("[acr-stream] exit rc=" + rc + " sig=" + sig); } catch (e) {} });
-console.log("[acr-stream] launcher started, spawned node -e child");
+var out = "", err = "";
+child.stdout.on("data", function (d) { out += d; });
+child.stderr.on("data", function (d) { err += d; });
+child.on("error", function (e) { post("acrerr", { kind: "diag", fields: { stage: "spawn", err: String(e) } }); });
+child.on("exit", function (rc, sig) {
+    post("acrexit", { kind: "diag", fields: { rc: rc, sig: sig, stdout: out.slice(0, 1500), stderr: err.slice(0, 1500) } });
+});
+setTimeout(function () {
+    post("acrsnap", { kind: "diag", fields: { stdout: out.slice(0, 1500), stderr: err.slice(0, 1500), alive: !child.killed } });
+}, 8000);
+console.log("[acrstream] launcher up node=" + process.version);
