@@ -1,42 +1,67 @@
 "use strict";
-// ACR live streamer - runs as root on the TV via the TizenBrew module chain.
-// Scrapes the ACRService process heap via dd /proc/<pid>/mem and streams, to the
-// PC, every JSON blob it finds. Classifies each blob:
-//   TX  = what the TV is ABOUT to send to Samsung  (pre-encryption plaintext:
-//         fingerprint "output bits" raws / recog_content / fp_ver + device ids)
-//   RX  = what Samsung sent DOWN to the TV         (post-decryption plaintext:
-//         matchInfo + the server-tunable config: grid / bit layout / maths /
-//         query_interval / AdQueryIntervalSec / sorconfigstring / thresholds)
-//   CFG = a nested config object inside either direction (the tunable knobs)
-// Everything is forwarded so nothing is lost; the PC side renders + logs it.
+// ACR live streamer - runs as root on the TV via TizenBrew node -e.
+// Scrapes the ACRService process heap via dd /proc/<pid>/mem and forwards every
+// JSON blob. Dual-channel so nothing is lost:
+//   * TCP stream -> PC:19999  (live viewer acr_feed.py)
+//   * HTTP POST  -> PC:9999   (proven capture channel; lands as capture_*.json)
+// Direction classification:
+//   TX  = TV -> Samsung (pre-encryption): fingerprint output bits raws/recog_content/fp_ver
+//   RX  = Samsung -> TV (post-decryption): matchInfo + server-tunable config
+//   CFG = the tunable knobs (query_interval / sorconfigstring / thresholds / grid / bit)
+// node 4.4-safe (var / function / no arrows / no template literals / indexOf only).
+
 var fs = require("fs");
 var net = require("net");
+var http = require("http");
 var cp = require("child_process");
 
 var PC = "192.168.1.64";
 var VIEW_PORT = 19999;
+var HTTP_PORT = 9999;
 
-// Keys that mark a blob as OUTBOUND (TV -> Samsung) : the fingerprint payload.
 var TX_KEYS = ["raws", "recog_content", "fp_ver", "device_id", "psid", "uduration",
                "tv_source", "tv_ch", "hdmi_info", "viewing", "query_sum", "try_cnt"];
-// Keys that mark a blob as INBOUND (Samsung -> TV) : match result + instructions.
 var RX_KEYS = ["matchInfo", "contentId", "channelId", "programId", "programName",
                "startTime", "mediaTime", "channelName", "bypassData", "engineType"];
-// Keys that are the server-tunable control knobs (the "grid / bit layout / maths").
 var CFG_KEYS = ["query_interval", "AdQueryIntervalSec", "EdgeQueryIntervalSec",
                 "refreshInterval", "DelayedServerQueryInterval", "query_mode",
                 "sorconfigstring", "matching", "MatchingServerURL", "threshold",
                 "thres", "grid", "bit", "layout", "sample", "fft", "mfcc", "lm_",
-                "query_info", "SetLMThres", "query_freq"];
+                "query_info", "query_freq"];
 
+// ---- TCP live stream (best-effort) ----
 var sock = null;
-function send(ev) {
+function sendTcp(ev) {
     var line = JSON.stringify(ev) + "\n";
     if (!sock || sock.destroyed) {
-        sock = net.connect(VIEW_PORT, PC);
-        sock.on("error", function () { sock = null; });
+        try {
+            sock = net.connect(VIEW_PORT, PC);
+            sock.on("error", function () { sock = null; });
+            sock.on("close", function () { sock = null; });
+        } catch (e) { sock = null; }
     }
     try { sock.write(line); } catch (e) { sock = null; }
+}
+
+// ---- HTTP POST capture (proven channel) ----
+function sendHttp(tag, obj) {
+    try {
+        var data = JSON.stringify(obj);
+        var req = http.request({ host: PC, port: HTTP_PORT, path: "/" + tag, method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
+            function (res) { try { res.resume(); } catch (e) {} });
+        req.on("error", function () {});
+        req.write(data);
+        req.end();
+    } catch (e) {}
+}
+
+function emit(ev) {
+    sendTcp(ev);
+    // also mirror to HTTP capture (throttled to avoid flooding :9999 with every blob)
+    if (ev.kind === "diag" || ev.kind === "cfg") {
+        sendHttp("acr_" + (ev.kind), ev);
+    }
 }
 
 function sh(cmd, cap) {
@@ -58,7 +83,6 @@ function ddBuf(pid, start, len) {
     }
 }
 
-// All readable RW regions (heap + anonymous + any lib .bss). Cap each at 4MB.
 function regions(pid) {
     var txt = sh("cat /proc/" + pid + "/maps", 200000);
     var regs = [];
@@ -71,15 +95,13 @@ function regions(pid) {
     return regs;
 }
 
-// Find the ACR engine pid. Prefer the 'ACRService' process name, fall back to /usr/bin/acr.
 function findPid() {
     var out = sh("ps -A 2>/dev/null | grep -i acr", 8000);
     var pid = null;
     out.split("\n").forEach(function (line) {
         if (/acr/i.test(line) && !/grep/i.test(line)) {
             var mm = line.trim().match(/^(\d+)/) || line.trim().match(/\b(\d{2,7})\b/);
-            if (mm && !pid) {
-                // prefer the service engine over the small acr-service-app bridge
+            if (mm) {
                 if (/ACRService|\/usr\/bin\/acr\b/i.test(line)) pid = parseInt(mm[1], 10);
                 else if (!pid) pid = parseInt(mm[1], 10);
             }
@@ -88,12 +110,13 @@ function findPid() {
     return pid;
 }
 
+function has(s, keys) {
+    for (var i = 0; i < keys.length; i++) if (s.indexOf(keys[i]) >= 0) return true;
+    return false;
+}
+
 function classify(s) {
-    var has = function (keys) {
-        for (var i = 0; i < keys.length; i++) if (s.indexOf(keys[i]) >= 0) return true;
-        return false;
-    };
-    var tx = has(TX_KEYS), rx = has(RX_KEYS), cfg = has(CFG_KEYS);
+    var tx = has(s, TX_KEYS), rx = has(s, RX_KEYS), cfg = has(s, CFG_KEYS);
     if (tx && rx) return "BOTH";
     if (tx) return "TX";
     if (rx) return "RX";
@@ -110,7 +133,6 @@ function pullFields(s, keys) {
     return out;
 }
 
-// Extract the biggest balanced JSON object starting at idx of '{'.
 function jsonAt(buf, idx) {
     var depth = 0, inStr = false, esc = false, end = -1;
     for (var i = idx; i < buf.length && i < idx + 200000; i++) {
@@ -130,34 +152,30 @@ function jsonAt(buf, idx) {
 
 var seen = {};
 var counts = { TX: 0, RX: 0, CFG: 0, BOTH: 0, OTHER: 0 };
+var firstBlobPosted = false;
 
 function poll() {
     var now = new Date().toISOString().slice(11, 19);
     var pid = findPid();
     if (!pid) {
-        send({ kind: "diag", ts: now, fields: { acr_pid: null, note: "ACRService not found" } });
+        emit({ kind: "diag", ts: now, fields: { acr_pid: null, note: "ACRService not found" } });
         return;
     }
     var regs;
     try { regs = regions(pid); } catch (e) {
-        send({ kind: "diag", ts: now, fields: { acr_pid: pid, err: String(e && e.message || e) } });
+        emit({ kind: "diag", ts: now, fields: { acr_pid: pid, err: String(e && e.message || e) } });
         return;
     }
     for (var r = 0; r < regs.length; r++) {
         var reg = regs[r];
         var data = ddBuf(pid, reg.start, reg.end - reg.start);
         if (!data || !data.length) continue;
-        // walk every '{' and try to lift a JSON object
         for (var i = 0; i < data.length; i++) {
             if (data[i] !== 123) continue;
             var j = jsonAt(data, i);
-            if (!j) continue;
-            // only care about blobs that carry ACR telemetry / config markers
-            if (j.length < 40) continue;
-            if (j.indexOf('"') < 0) continue;
+            if (!j || j.length < 40 || j.indexOf('"') < 0) continue;
             var dir = classify(j);
             if (dir === "OTHER") continue;
-            // de-dup on a stable slice of the blob
             var key = dir + "|" + j.slice(0, 240);
             if (seen[key]) continue;
             seen[key] = 1;
@@ -169,32 +187,46 @@ function poll() {
                 fields: pullFields(j, TX_KEYS.concat(RX_KEYS, CFG_KEYS)),
                 text: j.slice(0, 6000)
             };
-            send(ev);
-            // lift nested config knobs specifically so they show as their own line
+            emit(ev);
+            // post the first blob of each direction to :9999 as hard proof + full text
+            if (!firstBlobPosted || dir === "TX" || dir === "RX") {
+                sendHttp("acrblob_" + dir, ev);
+            }
             if (dir !== "CFG" && (j.indexOf("query_interval") >= 0 || j.indexOf("sorconfigstring") >= 0 ||
                 j.indexOf("AdQueryIntervalSec") >= 0 || j.indexOf("threshold") >= 0)) {
-                send({ kind: "cfg", ts: now, dir: "CFG", fields: pullFields(j, CFG_KEYS) });
+                emit({ kind: "cfg", ts: now, dir: "CFG", fields: pullFields(j, CFG_KEYS) });
             }
             i += j.length > 2 ? j.length - 2 : 0;
         }
     }
-    // clear dedup cache periodically so re-sent (updated) values are re-emitted
-    if (counts.TX + counts.RX + counts.CFG + counts.BOTH > 4000) { seen = {}; counts = { TX: 0, RX: 0, CFG: 0, BOTH: 0, OTHER: 0 }; }
+    if (counts.TX + counts.RX + counts.CFG + counts.BOTH > 4000) {
+        seen = {}; counts = { TX: 0, RX: 0, CFG: 0, BOTH: 0, OTHER: 0 };
+    }
 }
 
-send({ kind: "diag", ts: "boot", fields: { note: "acr streamer armed", pc: PC, port: VIEW_PORT, pid: process.pid } });
+// boot beacon to BOTH channels immediately (proof the module runs)
+var boot = { kind: "diag", ts: "boot", fields: { note: "acr streamer armed", pc: PC, port: VIEW_PORT, http: HTTP_PORT, pid: process.pid, node: process.version } };
+sendTcp(boot);
+sendHttp("acrboot", boot);
 
 var ticks = 0;
 var timer = setInterval(function () {
     ticks++;
     try { poll(); } catch (e) {
-        send({ kind: "diag", ts: new Date().toISOString().slice(11, 19), fields: { poll_error: String(e && e.message || e) } });
+        emit({ kind: "diag", ts: new Date().toISOString().slice(11, 19), fields: { poll_error: String(e && e.message || e) } });
     }
     if (ticks % 20 === 0) {
-        send({ kind: "diag", ts: new Date().toISOString().slice(11, 19),
-               fields: { heartbeat: ticks, acr_pid: findPid(), TX: counts.TX, RX: counts.RX, CFG: counts.CFG, BOTH: counts.BOTH } });
+        var hb = { kind: "diag", ts: new Date().toISOString().slice(11, 19),
+                   fields: { heartbeat: ticks, acr_pid: findPid(), TX: counts.TX, RX: counts.RX, CFG: counts.CFG, BOTH: counts.BOTH } };
+        emit(hb);
+        sendHttp("acrheartbeat", hb);
     }
-    if (ticks >= 2000) { clearInterval(timer); send({ kind: "diag", ts: "end", fields: { note: "streamer done (50min budget)", counts: counts } }); }
+    if (ticks >= 2000) {
+        clearInterval(timer);
+        var end = { kind: "diag", ts: "end", fields: { note: "streamer done", counts: counts } };
+        emit(end);
+        sendHttp("acrend", end);
+    }
 }, 1500);
 
-console.log("acr streamer armed");
+console.log("acr streamer armed node=" + process.version);
