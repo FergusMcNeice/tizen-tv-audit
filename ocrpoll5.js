@@ -39,7 +39,7 @@ function crs(method) {
     var r = sh("gdbus call --system --dest " + DEST + " --object-path " + OBJ +
                " --method " + DEST + "." + method, 1500);
     // gdbus prints like ('value',) or (12,) or (1, 2)
-    var m = /^\((.*)\)\s*$/s.exec(r.trim());
+    var m = /^\(([\s\S]*)\)\s*$/.exec(r.trim());
     return m ? m[1].replace(/^'|'$/g, "").trim() : r.trim().slice(0, 200);
 }
 
