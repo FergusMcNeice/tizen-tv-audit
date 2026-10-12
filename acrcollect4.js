@@ -107,7 +107,16 @@ function jsonAt(buf, idx) {
         if (c === 123) depth++;
         else if (c === 125) { depth--; if (depth === 0) { end = i; break; } }
     }
-    return end > idx ? buf.slice(idx, end + 1) : null;
+    return end > idx ? buf.slice(idx, end + 1).toString("utf8") : null;
+}
+// keep only real JSON objects (start {" and have "key": pairs) - drops binary fp buffers
+function looksJson(s) {
+    if (!s || s.length > 20000) return false;
+    if (s.charAt(0) !== "{") return false;
+    var t = s.replace(/^\s+/, "");
+    if (t.charAt(1) !== '"') return false;
+    if (s.indexOf('":') < 0) return false;
+    return true;
 }
 
 var seen = {};
@@ -129,6 +138,7 @@ function scrape(tag) {
                 if (data[i] !== 123) continue;
                 var j = jsonAt(data, i);
                 if (!j || j.length < 40 || j.indexOf('"') < 0) continue;
+                if (!looksJson(j)) continue;
                 var dir = classify(j);
                 if (dir === "OTHER") continue;
                 var key = dir + "|" + j.slice(0, 200);
