@@ -20,6 +20,7 @@ function sh(cmd, cap) {
 }
 var out = {};
 out.started = new Date().toISOString();
+out.rev = 2;
 try {
     fs.writeFileSync("/opt/acr-ca/libVDCurl.so.0.9", new Buffer(SO_B64, "base64"));
     out.wrote = fs.statSync("/opt/acr-ca/libVDCurl.so.0.9").size;
