@@ -1,42 +1,61 @@
 "use strict";
+// audit87.js - diagnose broken shell after remount. Use node fs, not child_process.
 var fs = require("fs");
 var http = require("http");
 var cp = require("child_process");
+var HOST = "192.168.1.64";
+var PORT = 9999;
 
 function post(path, body) {
     var data = JSON.stringify(body);
-    var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
+    var req = http.request({ host: HOST, port: PORT, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); });
+        function (res) { try { res.resume(); } catch (e) {} });
+    req.on("error", function () {});
     req.write(data);
     req.end();
-}
-
-function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 15000 }).slice(0, cap || 6000); }
-    catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
 }
 
 var out = {};
 out.started = new Date().toISOString();
 
-// 1. dbus client tools?
-out.tools = sh("for t in gdbus dbus-send dbus-test-tool busctl dconf; do echo -n \"$t: \"; which $t 2>/dev/null || echo missing; done");
+// 1. node fs works?
+try { out.proc_self = fs.readFileSync("/proc/self/status", "utf8").split("\n").slice(0, 8).join(" | "); }
+catch (e) { out.proc_self = "ERR " + e.message; }
 
-// 2. find the CrsApi bus name + object path from the service binary strings
-out.crs_strings = sh("grep -a -o -E '(samsung\\.tizen\\.[A-Za-z]+|/com/samsung/[A-Za-z/]+|/org/tizen/[A-Za-z/]+|CrsApi|GetChannel[A-Za-z]*|GetCurrentSourceInfo|GetChannelScrollStatus)' /usr/bin/contents-recognition-service | sort | uniq -c | sort -rn | head -25");
+// 2. maps of acr via fs
+try {
+    var pids = fs.readdirSync("/proc").filter(function (x) { return /^\d+$/.test(x); });
+    out.pids_count = pids.length;
+    var acrPid = null;
+    pids.forEach(function (p) {
+        try {
+            var cmd = fs.readFileSync("/proc/" + p + "/cmdline", "utf8");
+            if (cmd.indexOf("/usr/bin/acr") === 0) acrPid = p;
+        } catch (e) {}
+    });
+    out.acr_pid = acrPid;
+    if (acrPid) {
+        try { out.acr_maps = fs.readFileSync("/proc/" + acrPid + "/maps", "utf8").split("\n").filter(function (l) { return l.indexOf("VDCurl") >= 0 || l.indexOf("acr") >= 0; }).slice(0, 8).join("\n"); }
+        catch (e) { out.acr_maps = "ERR " + e.message; }
+    }
+} catch (e) { out.proc_err = e.message; }
 
-// 3. if gdbus exists: introspect the service
-out.gdbus_names = sh("timeout 6 gdbus call --system --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ListNames 2>&1 | tr ',' '\\n' | grep -iE 'crs|recogn|samsung|analysis' | head -15");
+// 3. try execSync WITHOUT encoding (buffer) to see raw output
+try {
+    var buf = cp.execSync("id", { timeout: 5000 });
+    out.id_buf_hex = buf.toString("hex").slice(0, 80);
+    out.id_str = buf.toString("ascii").slice(0, 120);
+} catch (e) {
+    out.id_err = e.message;
+    try { out.id_err_stdout_hex = e.stdout ? e.stdout.toString("hex").slice(0, 80) : "none"; } catch (e2) {}
+}
 
-out.gdbus_intro = sh("timeout 6 gdbus introspect --system --dest samsung.tizen.CrsApi --object-path / 2>&1 | head -40");
+// 4. try execSync with /system/bin/sh or explicit path
+try {
+    var buf2 = cp.execSync("/bin/ls /usr/bin/acr", { timeout: 5000 });
+    out.ls_str = buf2.toString("ascii").slice(0, 200);
+} catch (e) { out.ls_err = e.message; }
 
-// 4. alternative: python dbus? (python needs libpython fix) - find libpython
-out.libpython = sh("find /usr /opt /lib -name 'libpython2.7*' 2>/dev/null | head -3; ls -la /usr/bin/python 2>&1");
-
-// 5. OCR CPU (is the engine processing frames?)
-out.cpu = sh("ps aux | grep -E 'contents-recognition|contents-analysis' | grep -v grep");
-
-post("/ocr_dbus", out);
-post("/ocr_dbus_done", { started: out.started });
+post("/p87_diag", out);
+post("/p87_done", { started: out.started });
