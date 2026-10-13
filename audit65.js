@@ -1,4 +1,5 @@
 "use strict";
+var fs = require("fs");
 var http = require("http");
 var cp = require("child_process");
 
@@ -6,18 +7,53 @@ function post(path, body) {
     var data = JSON.stringify(body);
     var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + e.message); });
-    req.write(data); req.end();
+        function (res) { console.log("posted " + path + " -> " + res.statusCode); });
+    req.on("error", function (e) { console.log("post error " + e.message); });
+    req.write(data);
+    req.end();
 }
-
-function sh(cmd, cap, to) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: to || 30000 }).slice(0, cap || 8000); }
+function sh(cmd, cap) {
+    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 25000 }).slice(0, cap || 1500); }
     catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
 }
-
 var out = {};
-out.started = new Date().toISOString();
-out.scan = sh("kill $(pidof acr) 2>/dev/null; touch /tmp/acr/path_exists/acr_ready; RES=''; for i in $(seq 1 12); do PID=$(pidof acr | awk '{print $1}'); if [ -n \"$PID\" ]; then H=$(grep '\\[heap\\]' /proc/$PID/maps | cut -d- -f1 | head -1); if [ -n \"$H\" ]; then X=$(dd if=/proc/$PID/mem bs=4096 skip=$((0x$H/4096)) count=200 2>/dev/null | grep -a -o -E '.{0,50}(device_id|recog_content|query_info|fp_ver|uduration|matchInfo|contentId|firmware_version|hdmi_info|tz_history|sorconfig|raws).{0,320}' | head -6); if [ -n \"$X\" ]; then RES=\"$RES\"\"$X\"; fi; fi; fi; sleep 3; done; echo \"$RES\" | sort -u | head -25", 20000, 200000);
-post("/acr65", out);
-post("/acr65_done", { started: out.started });
+out.umount = sh("umount -l /usr/lib/libVDCurl.so.0.9; echo UMOUNT_RC=$?; md5sum /usr/lib/libVDCurl.so.0.9; cat /proc/mounts | grep -i vdc | head -3");
+post("/acr_fix1", out);
+
+setTimeout(function () {
+    var o = {};
+    try {
+        var c = cp.spawn("/usr/bin/acr", [], { detached: true, stdio: "ignore" });
+        c.unref();
+        o.spawn = "pid=" + c.pid;
+    } catch (e) { o.spawn = "ERR " + e.message; }
+    post("/acr_fix2", o);
+}, 3000);
+
+setTimeout(function () {
+    var o = {};
+    try {
+        var ps = cp.execSync("ps -ef | grep '/usr/bin/acr' | grep -v grep | head -1", { encoding: "utf8" });
+        o.ps_line = ps.trim();
+        var pid = ps.trim().split(/[ \t]+/)[1];
+        var maps = fs.readFileSync("/proc/" + pid + "/maps", "utf8");
+        var target = null;
+        maps.split("\n").forEach(function (L) {
+            var m = L.match(/^([0-9a-f]+)-[0-9a-f]+ r-xp 00000000 .*libVDCurl/);
+            if (m) target = parseInt(m[1], 16) + 0xbc24;
+        });
+        o.patch_addr = target ? "0x" + target.toString(16) : "NOT FOUND";
+        if (target) {
+            var mem = fs.openSync("/proc/" + pid + "/mem", "r+");
+            var b = new Buffer(4);
+            fs.readSync(mem, b, 0, 4, target);
+            o.before = b.toString("hex");
+            var stub = new Buffer([0x01, 0x20, 0x70, 0x47]);
+            fs.writeSync(mem, stub, 0, 4, target);
+            fs.readSync(mem, b, 0, 4, target);
+            o.after = b.toString("hex");
+            fs.closeSync(mem);
+        }
+    } catch (e) { o.err = "" + (e.stack || e.message); }
+    post("/acr_fix3", o);
+}, 9000);
