@@ -1,85 +1,40 @@
 "use strict";
-var fs = require("fs");
+// audit84.js - identify WHICH process on the TV is connecting to the PC :443.
+// Match /proc/net/tcp remote ports to /proc/<pid>/fd socket inodes, and list
+// every process that has libVDCurl/libssl loaded (candidate TLS clients).
 var http = require("http");
 var cp = require("child_process");
+var HOST = "192.168.1.64";
+var PORT = 9999;
 
 function post(path, body) {
     var data = JSON.stringify(body);
-    var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
+    var req = http.request({ host: HOST, port: PORT, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); });
+        function (res) { try { res.resume(); } catch (e) {} });
+    req.on("error", function () {});
     req.write(data);
     req.end();
 }
-
 function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 20000 }).slice(0, cap || 8000); }
+    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 20000 }).slice(0, cap || 12000); }
     catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
-}
-
-function stringsOf(buf, minLen) {
-    var out = [], cur = "";
-    for (var i = 0; i < buf.length; i++) {
-        var c = buf[i];
-        if (c >= 32 && c < 127) cur += String.fromCharCode(c);
-        else { if (cur.length >= (minLen || 4)) out.push(cur); cur = ""; }
-    }
-    if (cur.length >= (minLen || 4)) out.push(cur);
-    return out;
-}
-
-function rwRegions(pid) {
-    var txt = sh("cat /proc/" + pid + "/maps", 120000);
-    var regs = [];
-    txt.split("\n").forEach(function (line) {
-        var m = line.match(/^([0-9a-f]+)-([0-9a-f]+)\s+rw/);
-        if (!m) return;
-        var a = parseInt(m[1], 16), b = parseInt(m[2], 16);
-        if (b > a) regs.push({ start: a, end: b, label: line.slice(73).trim() || "anon" });
-    });
-    return regs;
 }
 
 var out = {};
 out.started = new Date().toISOString();
-out.tools = sh("for t in strings dd od hexdump python3 python; do echo -n \"$t: \"; which $t 2>/dev/null || echo missing; done");
 
-// node-fs /proc/pid/mem test
-function sampleNode(pid, wantJson) {
-    var regs = rwRegions(pid);
-    var result = { regions: regs.length, strings: [], err: null };
-    try {
-        var fd = fs.openSync("/proc/" + pid + "/mem", "r");
-        var total = 0;
-        for (var i = 0; i < regs.length && total < 6 * 1024 * 1024; i++) {
-            var r = regs[i];
-            var len = Math.min(r.end - r.start, 2 * 1024 * 1024);
-            var buf = new Buffer(len);
-            var n = fs.readSync(fd, buf, 0, len, r.start);
-            total += n;
-            var strs = stringsOf(buf.slice(0, n), wantJson ? 8 : 5);
-            for (var j = 0; j < strs.length; j++) {
-                var s = strs[j];
-                if (wantJson) {
-                    if (/\{/.test(s) && /(channelName|programId|psid|contentId|recog|title|Title|mediaTime)/.test(s)) {
-                        result.strings.push(s.slice(0, 400));
-                    }
-                } else {
-                    if (result.strings.length < 50 && /[A-Za-z]{3}/.test(s)) result.strings.push(s.slice(0, 120));
-                }
-            }
-        }
-        fs.closeSync(fd);
-    } catch (e) {
-        result.err = String(e.message || e);
-    }
-    return result;
-}
+// PC IP hex = C0A80140 (192.168.1.64)
+out.tcp443 = sh("cat /proc/net/tcp | head -1; cat /proc/net/tcp | grep -i ':01BB' | head -20", 4000);
 
-out.node_mem_ocr = sampleNode(1394, false);
-out.node_mem_acr = sampleNode(1962, true);
-out.node_mem_analysis = sampleNode(1395, true);
+// find socket inodes for connections to :443
+out.inodes = sh("for line in $(cat /proc/net/tcp | grep -i ':01BB'); do echo $line; done | awk '{print $10}' | sort -u | head -20", 1500);
 
-post("/ocr_probe4", out);
-post("/ocr_probe4_done", { started: out.started });
+// map inodes to pids
+out.pids = sh("for ino in $(cat /proc/net/tcp | grep -i ':01BB' | awk '{print $10}' | sort -u); do for fd in /proc/[0-9]*/fd/*; do ln=$(readlink $fd 2>/dev/null); if [ \"$ln\" = \"socket:[$ino]\" ]; then pid=$(echo $fd | cut -d/ -f3); echo \"inode=$ino pid=$pid $(cat /proc/$pid/cmdline | tr '\\0' ' ')\"; fi; done; done | head -30", 6000);
+
+// all processes with VDCurl or libssl mapped (TLS clients)
+out.tls_procs = sh("for p in /proc/[0-9]*; do pid=$(basename $p); if grep -q 'libVDCurl\\|libssl' $p/maps 2>/dev/null; then echo \"PID $pid : $(cat $p/cmdline | tr '\\0' ' ' | head -c 120)\"; fi; done", 6000);
+
+post("/p84_diag", out);
+post("/p84_done", { started: out.started });
